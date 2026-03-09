@@ -23,8 +23,9 @@
     cursor: pointer;
   }
 
-  #status {
+  #status, #score {
     margin: 8px;
+    font-size: 18px;
   }
 
   video {
@@ -43,6 +44,7 @@
 
 <button id="reset">Reset</button>
 <div id="status">Starting camera…</div>
+<div id="score">Score: 0</div>
 
 <video id="cam" autoplay playsinline muted></video>
 <canvas id="view" width="960" height="540"></canvas>
@@ -52,6 +54,7 @@ const video = document.getElementById("cam");
 const canvas = document.getElementById("view");
 const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const statusEl = document.getElementById("status");
+const scoreEl = document.getElementById("score");
 const resetBtn = document.getElementById("reset");
 
 // --- settings ---
@@ -61,10 +64,16 @@ const START_CIRCLE = {
   r: 35
 };
 
-const SEARCH_RADIUS = 70;      // local search after lock
-const MIN_PIXELS = 40;         // minimum white pixels to count as object
-const BRIGHT_MIN = 210;        // how white the paper needs to be
-const SAT_MAX = 40;            // how neutral / non-colorful it must be
+const TARGET_CIRCLE = {
+  x: 120,
+  y: canvas.height / 2,
+  r: 40
+};
+
+const SEARCH_RADIUS = 70;
+const MIN_PIXELS = 40;
+const BRIGHT_MIN = 210;
+const SAT_MAX = 40;
 const LOST_FRAMES_MAX = 10;
 
 let started = false;
@@ -72,6 +81,8 @@ let locked = false;
 let lostFrames = 0;
 let lastPos = null;
 let trail = [];
+let score = 0;
+let targetHit = false;
 
 // Start camera
 navigator.mediaDevices.getUserMedia({
@@ -85,7 +96,7 @@ navigator.mediaDevices.getUserMedia({
   video.srcObject = stream;
   video.onloadedmetadata = () => {
     video.play();
-    statusEl.textContent = "Place white paper circle in right-side start circle";
+    statusEl.textContent = "Place white paper circle in right-side START circle";
     requestAnimationFrame(loop);
   };
 }).catch(err => {
@@ -98,8 +109,14 @@ resetBtn.onclick = () => {
   lostFrames = 0;
   lastPos = null;
   trail = [];
-  statusEl.textContent = "Reset — place white paper circle in right-side start circle";
+  targetHit = false;
+  statusEl.textContent = "Reset — place white paper circle in right-side START circle";
+  updateScore();
 };
+
+function updateScore() {
+  scoreEl.textContent = `Score: ${score}`;
+}
 
 function dist(x1, y1, x2, y2) {
   return Math.hypot(x2 - x1, y2 - y1);
@@ -154,7 +171,7 @@ function findObject(searchArea = null) {
   const h = boxMaxY - boxMinY;
   const ratio = w > h ? w / Math.max(h, 1) : h / Math.max(w, 1);
 
-  // Helps reject long white streaks / glare
+  // Reject long white streaks
   if (ratio > 1.8) return null;
 
   return {
@@ -178,6 +195,18 @@ function drawStartCircle() {
   ctx.fillText("START", START_CIRCLE.x - 28, START_CIRCLE.y - 48);
 }
 
+function drawTargetCircle() {
+  ctx.strokeStyle = targetHit ? "#ff0000" : "#00ff00";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(TARGET_CIRCLE.x, TARGET_CIRCLE.y, TARGET_CIRCLE.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.fillStyle = targetHit ? "#ff0000" : "#00ff00";
+  ctx.font = "16px Arial";
+  ctx.fillText("TARGET", TARGET_CIRCLE.x - 34, TARGET_CIRCLE.y - 52);
+}
+
 function drawTrail() {
   if (trail.length < 2) return;
   ctx.strokeStyle = "#00ff00";
@@ -197,6 +226,18 @@ function drawTrackedPoint(pos) {
   ctx.fill();
 }
 
+function checkTargetHit(pos) {
+  if (targetHit) return;
+
+  const d = dist(pos.x, pos.y, TARGET_CIRCLE.x, TARGET_CIRCLE.y);
+  if (d <= TARGET_CIRCLE.r) {
+    targetHit = true;
+    score++;
+    updateScore();
+    statusEl.textContent = "Point scored!";
+  }
+}
+
 function loop() {
   requestAnimationFrame(loop);
 
@@ -205,6 +246,7 @@ function loop() {
 
   // Overlay graphics
   drawStartCircle();
+  drawTargetCircle();
   drawTrail();
 
   let result = null;
@@ -224,6 +266,7 @@ function loop() {
         started = true;
         lastPos = result;
         trail = [{ x: result.x, y: result.y }];
+        targetHit = false;
         statusEl.textContent = "Tracking started";
       }
     }
@@ -244,7 +287,11 @@ function loop() {
         trail.push({ x: result.x, y: result.y });
       }
 
-      statusEl.textContent = `Tracking — x: ${result.x.toFixed(0)} y: ${result.y.toFixed(0)}`;
+      checkTargetHit(result);
+
+      if (!targetHit) {
+        statusEl.textContent = `Tracking — x: ${result.x.toFixed(0)} y: ${result.y.toFixed(0)}`;
+      }
     } else {
       lostFrames++;
       if (lostFrames > LOST_FRAMES_MAX) {
@@ -259,6 +306,8 @@ function loop() {
     drawTrackedPoint(lastPos);
   }
 }
+
+updateScore();
 </script>
 
 </body>
