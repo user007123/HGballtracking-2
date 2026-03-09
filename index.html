@@ -13,7 +13,7 @@
     padding: 10px;
   }
 
-  button {
+  button, select {
     margin: 6px;
     padding: 8px 12px;
     background: #000;
@@ -21,11 +21,16 @@
     color: #0f0;
     border-radius: 6px;
     cursor: pointer;
+    font-size: 16px;
   }
 
   #status, #score {
     margin: 8px;
     font-size: 18px;
+  }
+
+  #controls {
+    margin-bottom: 10px;
   }
 
   video {
@@ -42,7 +47,13 @@
 </head>
 <body>
 
-<button id="reset">Reset</button>
+<div id="controls">
+  <button id="reset">Reset</button>
+  <button id="refreshCams">Refresh Cameras</button>
+  <select id="cameraSelect"></select>
+  <button id="startCam">Start Selected Camera</button>
+</div>
+
 <div id="status">Starting camera…</div>
 <div id="score">Score: 0</div>
 
@@ -56,6 +67,9 @@ const ctx = canvas.getContext("2d", { willReadFrequently: true });
 const statusEl = document.getElementById("status");
 const scoreEl = document.getElementById("score");
 const resetBtn = document.getElementById("reset");
+const cameraSelect = document.getElementById("cameraSelect");
+const refreshCamsBtn = document.getElementById("refreshCams");
+const startCamBtn = document.getElementById("startCam");
 
 // --- settings ---
 const START_CIRCLE = {
@@ -84,34 +98,127 @@ let trail = [];
 let score = 0;
 let targetHit = false;
 
-// Start camera
-navigator.mediaDevices.getUserMedia({
-  video: {
-    width: { ideal: 1280 },
-    height: { ideal: 720 },
-    frameRate: { ideal: 30, max: 60 },
-    facingMode: "user"
-  }
-}).then(stream => {
-  video.srcObject = stream;
-  video.onloadedmetadata = () => {
-    video.play();
-    statusEl.textContent = "Place white paper circle in right-side START circle";
-    requestAnimationFrame(loop);
-  };
-}).catch(err => {
-  statusEl.textContent = "Camera error: " + err.message;
-});
+let currentStream = null;
+let animationStarted = false;
 
-resetBtn.onclick = () => {
+// Ask for permission once, then populate list
+async function initCameraAccess() {
+  try {
+    const tempStream = await navigator.mediaDevices.getUserMedia({
+      video: true,
+      audio: false
+    });
+
+    currentStream = tempStream;
+    video.srcObject = tempStream;
+
+    await new Promise(resolve => {
+      video.onloadedmetadata = () => {
+        video.play();
+        resolve();
+      };
+    });
+
+    await populateCameraList();
+
+    if (!animationStarted) {
+      animationStarted = true;
+      requestAnimationFrame(loop);
+    }
+
+    statusEl.textContent = "Place white paper circle in right-side START circle";
+  } catch (err) {
+    statusEl.textContent = "Camera error: " + err.message;
+  }
+}
+
+async function populateCameraList() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const videoDevices = devices.filter(d => d.kind === "videoinput");
+
+    cameraSelect.innerHTML = "";
+
+    videoDevices.forEach((device, index) => {
+      const option = document.createElement("option");
+      option.value = device.deviceId;
+      option.textContent = device.label || `Camera ${index + 1}`;
+      cameraSelect.appendChild(option);
+    });
+
+    if (videoDevices.length === 0) {
+      const option = document.createElement("option");
+      option.textContent = "No cameras found";
+      option.value = "";
+      cameraSelect.appendChild(option);
+    }
+  } catch (err) {
+    statusEl.textContent = "Could not list cameras: " + err.message;
+  }
+}
+
+async function startSelectedCamera() {
+  const deviceId = cameraSelect.value;
+  if (!deviceId) {
+    statusEl.textContent = "No camera selected";
+    return;
+  }
+
+  try {
+    // stop previous stream
+    if (currentStream) {
+      currentStream.getTracks().forEach(track => track.stop());
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        deviceId: { exact: deviceId },
+        width: { ideal: 1280 },
+        height: { ideal: 720 },
+        frameRate: { ideal: 30, max: 60 }
+      },
+      audio: false
+    });
+
+    currentStream = stream;
+    video.srcObject = stream;
+
+    await new Promise(resolve => {
+      video.onloadedmetadata = () => {
+        video.play();
+        resolve();
+      };
+    });
+
+    resetTrackingOnly();
+    statusEl.textContent = "Camera switched — place ball in START circle";
+  } catch (err) {
+    statusEl.textContent = "Could not start selected camera: " + err.message;
+  }
+}
+
+function resetTrackingOnly() {
   started = false;
   locked = false;
   lostFrames = 0;
   lastPos = null;
   trail = [];
   targetHit = false;
+}
+
+resetBtn.onclick = () => {
+  resetTrackingOnly();
   statusEl.textContent = "Reset — place white paper circle in right-side START circle";
   updateScore();
+};
+
+refreshCamsBtn.onclick = async () => {
+  await populateCameraList();
+  statusEl.textContent = "Camera list refreshed";
+};
+
+startCamBtn.onclick = async () => {
+  await startSelectedCamera();
 };
 
 function updateScore() {
@@ -241,6 +348,8 @@ function checkTargetHit(pos) {
 function loop() {
   requestAnimationFrame(loop);
 
+  if (!video.videoWidth || !video.videoHeight) return;
+
   // Draw single camera view
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
@@ -252,7 +361,6 @@ function loop() {
   let result = null;
 
   if (!locked) {
-    // Search near start circle until object enters it
     result = findObject({
       x: START_CIRCLE.x,
       y: START_CIRCLE.y,
@@ -271,7 +379,6 @@ function loop() {
       }
     }
   } else {
-    // Track around last known position
     result = findObject({
       x: lastPos.x,
       y: lastPos.y,
@@ -308,6 +415,7 @@ function loop() {
 }
 
 updateScore();
+initCameraAccess();
 </script>
 
 </body>
