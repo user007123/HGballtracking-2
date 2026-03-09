@@ -2,13 +2,41 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>HoverGreens Ball Tracker (Calibrated)</title>
+<title>HoverGreens Ball Tracker Test</title>
 <style>
-  body { background:#000; color:#0f0; font-family:Arial; text-align:center; margin:0; }
-  button { margin:6px; padding:8px 12px; background:#000; border:1px solid #0f0; color:#0f0; border-radius:6px; cursor:pointer; }
-  #status { margin:8px; }
-  video { display:none; }
-  canvas { display:block; margin:6px auto; background:#000; }
+  body {
+    background: #000;
+    color: #0f0;
+    font-family: Arial, sans-serif;
+    text-align: center;
+    margin: 0;
+    padding: 10px;
+  }
+
+  button {
+    margin: 6px;
+    padding: 8px 12px;
+    background: #000;
+    border: 1px solid #0f0;
+    color: #0f0;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  #status {
+    margin: 8px;
+  }
+
+  video {
+    display: none;
+  }
+
+  canvas {
+    display: block;
+    margin: 6px auto;
+    background: #000;
+    border: 1px solid #0f0;
+  }
 </style>
 </head>
 <body>
@@ -17,103 +45,221 @@
 <div id="status">Starting camera…</div>
 
 <video id="cam" autoplay playsinline muted></video>
-<canvas id="proc" width="640" height="360"></canvas>
-<canvas id="view" width="1180" height="370"></canvas>
+<canvas id="view" width="960" height="540"></canvas>
 
 <script>
-const vid=document.getElementById("cam");
-const proc=document.getElementById("proc"), pctx=proc.getContext("2d",{willReadFrequently:true});
-const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadFrequently:true});
-const status=document.getElementById("status");
-const reset=document.getElementById("reset");
+const video = document.getElementById("cam");
+const canvas = document.getElementById("view");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+const statusEl = document.getElementById("status");
+const resetBtn = document.getElementById("reset");
 
-// === calibrated thresholds ===
-const ROI=40;
-const BR_MIN=50, BR_MAX=130;  // from your ball readings
-const SAT_MAX=25;             // your ball sat ~15–17
-const MAX_DIFF=22;            // allowed channel difference
-const HOLD=1;
-const STOP=5;
-
-let roi=null, trail=[], last=null, hold=0, still=0, stopT=null, lastFrame=null, tracking=false;
-
-// get cam @ 720p60
-navigator.mediaDevices.getUserMedia({
-  video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}}
-}).then(s=>{
-  vid.srcObject=s; vid.onloadedmetadata=()=>{vid.play();status.textContent="Click ball to lock";loop();};
-});
-
-// reset
-reset.onclick=()=>{roi=null;trail=[];last=null;tracking=false;hold=0;still=0;stopT=null;status.textContent="Reset — click ball";};
-
-// click = set ROI
-view.onclick=e=>{
-  const r=view.getBoundingClientRect();
-  const x=(e.clientX-r.left)*(view.width/r.width);
-  const y=(e.clientY-r.top)*(view.height/r.height);
-  roi={x:x-ROI/2,y:y-ROI/2}; status.textContent="Tracking…";
+// --- settings ---
+const START_CIRCLE = {
+  x: canvas.width - 120,
+  y: canvas.height / 2,
+  r: 35
 };
 
-// convert coords to processing res
-function toP(x,y){return{px:(view.width-x)*(proc.width/view.width), py:(view.height-y)*(proc.height/view.height)};}
+const SEARCH_RADIUS = 70;      // local search after lock
+const MIN_PIXELS = 40;         // minimum white pixels to count as object
+const BRIGHT_MIN = 210;        // how white the paper needs to be
+const SAT_MAX = 40;            // how neutral / non-colorful it must be
+const LOST_FRAMES_MAX = 10;
 
-function detect(){
-  if(!roi)return{f:false};
-  pctx.drawImage(vid,0,0,proc.width,proc.height);
-  const p=toP(roi.x,roi.y), w=Math.floor(ROI*(proc.width/view.width)), h=Math.floor(ROI*(proc.height/view.height));
-  if(w<2||h<2)return{f:false};
-  const d=pctx.getImageData(p.px,p.py,w,h).data;
+let started = false;
+let locked = false;
+let lostFrames = 0;
+let lastPos = null;
+let trail = [];
 
-  let sumx=0,sumy=0,c=0,minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
-  for(let i=0;i<d.length;i+=4){
-    const R=d[i],G=d[i+1],B=d[i+2];
-    const br=(R+G+B)/3;
-    const sat=(Math.max(R,G,B)-Math.min(R,G,B));
-    const diff=(Math.abs(R-G)+Math.abs(G-B)+Math.abs(B-R))/3;
-
-    if(br>=BR_MIN && br<=BR_MAX && sat<=SAT_MAX && diff<=MAX_DIFF){
-      const px=(i/4)%w, py=Math.floor((i/4)/w);
-      c++; sumx+=px; sumy+=py;
-      if(px<minx)minx=px;if(px>maxx)maxx=px;
-      if(py<miny)miny=py;if(py>maxy)maxy=py;
-    }
+// Start camera
+navigator.mediaDevices.getUserMedia({
+  video: {
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 60 },
+    facingMode: "user"
   }
-  if(c<6)return{f:false};
-  const ww=maxx-minx, hh=maxy-miny; if(Math.abs(ww-hh)>10)return{f:false};
-  const cx=p.px+(sumx/c), cy=p.py+(sumy/c);
-  return{f:true,x:view.width-(cx*(view.width/proc.width)),y:view.height-(cy*(view.height/proc.height))};
+}).then(stream => {
+  video.srcObject = stream;
+  video.onloadedmetadata = () => {
+    video.play();
+    statusEl.textContent = "Place white paper circle in right-side start circle";
+    requestAnimationFrame(loop);
+  };
+}).catch(err => {
+  statusEl.textContent = "Camera error: " + err.message;
+});
+
+resetBtn.onclick = () => {
+  started = false;
+  locked = false;
+  lostFrames = 0;
+  lastPos = null;
+  trail = [];
+  statusEl.textContent = "Reset — place white paper circle in right-side start circle";
+};
+
+function dist(x1, y1, x2, y2) {
+  return Math.hypot(x2 - x1, y2 - y1);
 }
 
-function drawTrail(){if(trail.length>1){vctx.strokeStyle="#0f0";vctx.beginPath();vctx.moveTo(trail[0].x,trail[0].y);for(let i=1;i<trail.length;i++)vctx.lineTo(trail[i].x,trail[i].y);vctx.stroke();}}
+function isWhiteLike(r, g, b) {
+  const bright = (r + g + b) / 3;
+  const sat = Math.max(r, g, b) - Math.min(r, g, b);
+  return bright >= BRIGHT_MIN && sat <= SAT_MAX;
+}
 
-function loop(){
-  requestAnimationFrame(loop);
-  const now=performance.now();
-  if(stopT&&now-stopT<5000){if(lastFrame)vctx.putImageData(lastFrame,0,0);drawTrail();return;}
+function findObject(searchArea = null) {
+  const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
+  const data = frame.data;
 
-  // draw cam flip
-  vctx.save();vctx.scale(-1,-1);vctx.drawImage(vid,-view.width,-view.height,view.width,view.height);vctx.restore();
-  drawTrail();
+  let minX = searchArea ? Math.max(0, Math.floor(searchArea.x - searchArea.r)) : 0;
+  let maxX = searchArea ? Math.min(canvas.width - 1, Math.floor(searchArea.x + searchArea.r)) : canvas.width - 1;
+  let minY = searchArea ? Math.max(0, Math.floor(searchArea.y - searchArea.r)) : 0;
+  let maxY = searchArea ? Math.min(canvas.height - 1, Math.floor(searchArea.y + searchArea.r)) : canvas.height - 1;
 
-  if(roi){vctx.strokeStyle="#0f0";vctx.strokeRect(roi.x,roi.y,ROI,ROI);}
+  let sumX = 0;
+  let sumY = 0;
+  let count = 0;
+  let boxMinX = Infinity, boxMaxX = -Infinity;
+  let boxMinY = Infinity, boxMaxY = -Infinity;
 
-  const r=detect();
-  if(r.f){
-    trail.push(r);roi.x=r.x-ROI/2;roi.y=r.y-ROI/2;
-    vctx.fillStyle="#0f0";vctx.beginPath();vctx.arc(r.x,r.y,4,0,2*Math.PI);vctx.fill();
-    lastFrame=vctx.getImageData(0,0,view.width,view.height);last=r;tracking=true;hold=0;
-  } else if(tracking&&last){
-    hold++;if(hold<=HOLD){trail.push(last);roi.x=last.x-ROI/2;roi.y=last.y-ROI/2;}else tracking=false;
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      if (searchArea && dist(x, y, searchArea.x, searchArea.y) > searchArea.r) continue;
+
+      const i = (y * canvas.width + x) * 4;
+      const r = data[i];
+      const g = data[i + 1];
+      const b = data[i + 2];
+
+      if (isWhiteLike(r, g, b)) {
+        sumX += x;
+        sumY += y;
+        count++;
+
+        if (x < boxMinX) boxMinX = x;
+        if (x > boxMaxX) boxMaxX = x;
+        if (y < boxMinY) boxMinY = y;
+        if (y > boxMaxY) boxMaxY = y;
+      }
+    }
   }
 
-  if(trail.length>6){
-    const a=trail.at(-1),b=trail.at(-5);
-    const d=Math.hypot(a.x-b.x,a.y-b.y);
-    still=(d<1)?still+1:0;
-    if(still>STOP){stopT=now;lastFrame=vctx.getImageData(0,0,view.width,view.height);status.textContent="Stopped — trace holding";return;}
+  if (count < MIN_PIXELS) return null;
+
+  const w = boxMaxX - boxMinX;
+  const h = boxMaxY - boxMinY;
+  const ratio = w > h ? w / Math.max(h, 1) : h / Math.max(w, 1);
+
+  // Helps reject long white streaks / glare
+  if (ratio > 1.8) return null;
+
+  return {
+    x: sumX / count,
+    y: sumY / count,
+    count,
+    w,
+    h
+  };
+}
+
+function drawStartCircle() {
+  ctx.strokeStyle = "#00ff00";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.arc(START_CIRCLE.x, START_CIRCLE.y, START_CIRCLE.r, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.fillStyle = "#00ff00";
+  ctx.font = "16px Arial";
+  ctx.fillText("START", START_CIRCLE.x - 28, START_CIRCLE.y - 48);
+}
+
+function drawTrail() {
+  if (trail.length < 2) return;
+  ctx.strokeStyle = "#00ff00";
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(trail[0].x, trail[0].y);
+  for (let i = 1; i < trail.length; i++) {
+    ctx.lineTo(trail[i].x, trail[i].y);
+  }
+  ctx.stroke();
+}
+
+function drawTrackedPoint(pos) {
+  ctx.fillStyle = "#00ff00";
+  ctx.beginPath();
+  ctx.arc(pos.x, pos.y, 6, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+
+  // Draw single camera view
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+  // Overlay graphics
+  drawStartCircle();
+  drawTrail();
+
+  let result = null;
+
+  if (!locked) {
+    // Search near start circle until object enters it
+    result = findObject({
+      x: START_CIRCLE.x,
+      y: START_CIRCLE.y,
+      r: START_CIRCLE.r + 20
+    });
+
+    if (result) {
+      const d = dist(result.x, result.y, START_CIRCLE.x, START_CIRCLE.y);
+      if (d <= START_CIRCLE.r + 10) {
+        locked = true;
+        started = true;
+        lastPos = result;
+        trail = [{ x: result.x, y: result.y }];
+        statusEl.textContent = "Tracking started";
+      }
+    }
+  } else {
+    // Track around last known position
+    result = findObject({
+      x: lastPos.x,
+      y: lastPos.y,
+      r: SEARCH_RADIUS
+    });
+
+    if (result) {
+      lostFrames = 0;
+      lastPos = result;
+
+      const prev = trail.length ? trail[trail.length - 1] : null;
+      if (!prev || dist(prev.x, prev.y, result.x, result.y) > 2) {
+        trail.push({ x: result.x, y: result.y });
+      }
+
+      statusEl.textContent = `Tracking — x: ${result.x.toFixed(0)} y: ${result.y.toFixed(0)}`;
+    } else {
+      lostFrames++;
+      if (lostFrames > LOST_FRAMES_MAX) {
+        locked = false;
+        lastPos = null;
+        statusEl.textContent = "Lost object — move white circle back to START";
+      }
+    }
+  }
+
+  if (lastPos) {
+    drawTrackedPoint(lastPos);
   }
 }
 </script>
+
 </body>
 </html>
