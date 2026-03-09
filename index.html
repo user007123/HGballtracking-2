@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>HoverGreens Ball Tracker (Calibrated)</title>
+<style>
+  body { background:#000; color:#0f0; font-family:Arial; text-align:center; margin:0; }
+  button { margin:6px; padding:8px 12px; background:#000; border:1px solid #0f0; color:#0f0; border-radius:6px; cursor:pointer; }
+  #status { margin:8px; }
+  video { display:none; }
+  canvas { display:block; margin:6px auto; background:#000; }
+</style>
+</head>
+<body>
+
+<button id="reset">Reset</button>
+<div id="status">Starting camera…</div>
+
+<video id="cam" autoplay playsinline muted></video>
+<canvas id="proc" width="640" height="360"></canvas>
+<canvas id="view" width="1180" height="370"></canvas>
+
+<script>
+const vid=document.getElementById("cam");
+const proc=document.getElementById("proc"), pctx=proc.getContext("2d",{willReadFrequently:true});
+const view=document.getElementById("view"), vctx=view.getContext("2d",{willReadFrequently:true});
+const status=document.getElementById("status");
+const reset=document.getElementById("reset");
+
+// === calibrated thresholds ===
+const ROI=40;
+const BR_MIN=50, BR_MAX=130;  // from your ball readings
+const SAT_MAX=25;             // your ball sat ~15–17
+const MAX_DIFF=22;            // allowed channel difference
+const HOLD=1;
+const STOP=5;
+
+let roi=null, trail=[], last=null, hold=0, still=0, stopT=null, lastFrame=null, tracking=false;
+
+// get cam @ 720p60
+navigator.mediaDevices.getUserMedia({
+  video:{width:{ideal:1280},height:{ideal:720},frameRate:{ideal:60,max:60}}
+}).then(s=>{
+  vid.srcObject=s; vid.onloadedmetadata=()=>{vid.play();status.textContent="Click ball to lock";loop();};
+});
+
+// reset
+reset.onclick=()=>{roi=null;trail=[];last=null;tracking=false;hold=0;still=0;stopT=null;status.textContent="Reset — click ball";};
+
+// click = set ROI
+view.onclick=e=>{
+  const r=view.getBoundingClientRect();
+  const x=(e.clientX-r.left)*(view.width/r.width);
+  const y=(e.clientY-r.top)*(view.height/r.height);
+  roi={x:x-ROI/2,y:y-ROI/2}; status.textContent="Tracking…";
+};
+
+// convert coords to processing res
+function toP(x,y){return{px:(view.width-x)*(proc.width/view.width), py:(view.height-y)*(proc.height/view.height)};}
+
+function detect(){
+  if(!roi)return{f:false};
+  pctx.drawImage(vid,0,0,proc.width,proc.height);
+  const p=toP(roi.x,roi.y), w=Math.floor(ROI*(proc.width/view.width)), h=Math.floor(ROI*(proc.height/view.height));
+  if(w<2||h<2)return{f:false};
+  const d=pctx.getImageData(p.px,p.py,w,h).data;
+
+  let sumx=0,sumy=0,c=0,minx=1e9,maxx=-1e9,miny=1e9,maxy=-1e9;
+  for(let i=0;i<d.length;i+=4){
+    const R=d[i],G=d[i+1],B=d[i+2];
+    const br=(R+G+B)/3;
+    const sat=(Math.max(R,G,B)-Math.min(R,G,B));
+    const diff=(Math.abs(R-G)+Math.abs(G-B)+Math.abs(B-R))/3;
+
+    if(br>=BR_MIN && br<=BR_MAX && sat<=SAT_MAX && diff<=MAX_DIFF){
+      const px=(i/4)%w, py=Math.floor((i/4)/w);
+      c++; sumx+=px; sumy+=py;
+      if(px<minx)minx=px;if(px>maxx)maxx=px;
+      if(py<miny)miny=py;if(py>maxy)maxy=py;
+    }
+  }
+  if(c<6)return{f:false};
+  const ww=maxx-minx, hh=maxy-miny; if(Math.abs(ww-hh)>10)return{f:false};
+  const cx=p.px+(sumx/c), cy=p.py+(sumy/c);
+  return{f:true,x:view.width-(cx*(view.width/proc.width)),y:view.height-(cy*(view.height/proc.height))};
+}
+
+function drawTrail(){if(trail.length>1){vctx.strokeStyle="#0f0";vctx.beginPath();vctx.moveTo(trail[0].x,trail[0].y);for(let i=1;i<trail.length;i++)vctx.lineTo(trail[i].x,trail[i].y);vctx.stroke();}}
+
+function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now();
+  if(stopT&&now-stopT<5000){if(lastFrame)vctx.putImageData(lastFrame,0,0);drawTrail();return;}
+
+  // draw cam flip
+  vctx.save();vctx.scale(-1,-1);vctx.drawImage(vid,-view.width,-view.height,view.width,view.height);vctx.restore();
+  drawTrail();
+
+  if(roi){vctx.strokeStyle="#0f0";vctx.strokeRect(roi.x,roi.y,ROI,ROI);}
+
+  const r=detect();
+  if(r.f){
+    trail.push(r);roi.x=r.x-ROI/2;roi.y=r.y-ROI/2;
+    vctx.fillStyle="#0f0";vctx.beginPath();vctx.arc(r.x,r.y,4,0,2*Math.PI);vctx.fill();
+    lastFrame=vctx.getImageData(0,0,view.width,view.height);last=r;tracking=true;hold=0;
+  } else if(tracking&&last){
+    hold++;if(hold<=HOLD){trail.push(last);roi.x=last.x-ROI/2;roi.y=last.y-ROI/2;}else tracking=false;
+  }
+
+  if(trail.length>6){
+    const a=trail.at(-1),b=trail.at(-5);
+    const d=Math.hypot(a.x-b.x,a.y-b.y);
+    still=(d<1)?still+1:0;
+    if(still>STOP){stopT=now;lastFrame=vctx.getImageData(0,0,view.width,view.height);status.textContent="Stopped — trace holding";return;}
+  }
+}
+</script>
+</body>
+</html>
