@@ -71,7 +71,7 @@ const cameraSelect = document.getElementById("cameraSelect");
 const refreshCamsBtn = document.getElementById("refreshCams");
 const startCamBtn = document.getElementById("startCam");
 
-// --- settings ---
+// ===== SETTINGS =====
 const START_CIRCLE = {
   x: canvas.width - 120,
   y: canvas.height / 2,
@@ -84,12 +84,24 @@ const TARGET_CIRCLE = {
   r: 40
 };
 
-const SEARCH_RADIUS = 70;
-const MIN_PIXELS = 40;
-const BRIGHT_MIN = 210;
-const SAT_MAX = 40;
-const LOST_FRAMES_MAX = 10;
+// Detection tuning
+const SEARCH_RADIUS = 95;
+const MIN_PIXELS = 20;
+const BRIGHT_MIN = 150;
+const SAT_MAX = 70;
+const LOST_FRAMES_MAX = 12;
 
+// Ball-lock tuning
+const MAX_JUMP = 55;
+const SIZE_TOLERANCE = 2.2;
+const MAX_PIXELCOUNT_SCALE = 3.2;
+const MAX_RATIO = 2.0;
+
+// Ready-lock tuning
+const READY_LOCK_MS = 400;     // ball must sit in start circle this long
+const READY_STABLE_MOVE = 14;  // movement allowed while arming lock
+
+// ===== STATE =====
 let started = false;
 let locked = false;
 let lostFrames = 0;
@@ -101,7 +113,14 @@ let targetHit = false;
 let currentStream = null;
 let animationStarted = false;
 
-// Ask for permission once, then populate list
+// ready-lock state
+let readyLockStart = null;
+let readyReference = null;
+
+// locked ball model
+let lockedBallModel = null;
+
+// ===== CAMERA SETUP =====
 async function initCameraAccess() {
   try {
     const tempStream = await navigator.mediaDevices.getUserMedia({
@@ -126,7 +145,7 @@ async function initCameraAccess() {
       requestAnimationFrame(loop);
     }
 
-    statusEl.textContent = "Place white paper circle in right-side START circle";
+    statusEl.textContent = "Place ball in START circle and hold briefly";
   } catch (err) {
     statusEl.textContent = "Camera error: " + err.message;
   }
@@ -165,7 +184,6 @@ async function startSelectedCamera() {
   }
 
   try {
-    // stop previous stream
     if (currentStream) {
       currentStream.getTracks().forEach(track => track.stop());
     }
@@ -175,7 +193,7 @@ async function startSelectedCamera() {
         deviceId: { exact: deviceId },
         width: { ideal: 1280 },
         height: { ideal: 720 },
-        frameRate: { ideal: 30, max: 60 }
+        frameRate: { ideal: 60, max: 60 }
       },
       audio: false
     });
@@ -191,12 +209,13 @@ async function startSelectedCamera() {
     });
 
     resetTrackingOnly();
-    statusEl.textContent = "Camera switched — place ball in START circle";
+    statusEl.textContent = "Camera switched — place ball in START circle and hold briefly";
   } catch (err) {
     statusEl.textContent = "Could not start selected camera: " + err.message;
   }
 }
 
+// ===== RESET =====
 function resetTrackingOnly() {
   started = false;
   locked = false;
@@ -204,11 +223,14 @@ function resetTrackingOnly() {
   lastPos = null;
   trail = [];
   targetHit = false;
+  readyLockStart = null;
+  readyReference = null;
+  lockedBallModel = null;
 }
 
 resetBtn.onclick = () => {
   resetTrackingOnly();
-  statusEl.textContent = "Reset — place white paper circle in right-side START circle";
+  statusEl.textContent = "Reset — place ball in START circle and hold briefly";
   updateScore();
 };
 
@@ -221,6 +243,7 @@ startCamBtn.onclick = async () => {
   await startSelectedCamera();
 };
 
+// ===== HELPERS =====
 function updateScore() {
   scoreEl.textContent = `Score: ${score}`;
 }
@@ -235,7 +258,7 @@ function isWhiteLike(r, g, b) {
   return bright >= BRIGHT_MIN && sat <= SAT_MAX;
 }
 
-function findObject(searchArea = null) {
+function findObject(searchArea = null, useLockedModel = false) {
   const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = frame.data;
 
@@ -274,32 +297,47 @@ function findObject(searchArea = null) {
 
   if (count < MIN_PIXELS) return null;
 
-  const w = boxMaxX - boxMinX;
-  const h = boxMaxY - boxMinY;
-  const ratio = w > h ? w / Math.max(h, 1) : h / Math.max(w, 1);
+  const w = Math.max(1, boxMaxX - boxMinX);
+  const h = Math.max(1, boxMaxY - boxMinY);
+  const ratio = w > h ? w / h : h / w;
 
-  // Reject long white streaks
-  if (ratio > 1.8) return null;
+  // reject long/skinny objects like shafts or streaks
+  if (ratio > MAX_RATIO) return null;
 
-  return {
+  const result = {
     x: sumX / count,
     y: sumY / count,
     count,
     w,
-    h
+    h,
+    ratio
   };
+
+  if (useLockedModel && lockedBallModel) {
+    if (result.w > lockedBallModel.w * SIZE_TOLERANCE) return null;
+    if (result.h > lockedBallModel.h * SIZE_TOLERANCE) return null;
+    if (result.count > lockedBallModel.count * MAX_PIXELCOUNT_SCALE) return null;
+  }
+
+  return result;
 }
 
 function drawStartCircle() {
-  ctx.strokeStyle = "#00ff00";
+  let color = "#00ff00";
+
+  if (readyLockStart && !locked) {
+    color = "#ffff00";
+  }
+
+  ctx.strokeStyle = color;
   ctx.lineWidth = 3;
   ctx.beginPath();
   ctx.arc(START_CIRCLE.x, START_CIRCLE.y, START_CIRCLE.r, 0, Math.PI * 2);
   ctx.stroke();
 
-  ctx.fillStyle = "#00ff00";
+  ctx.fillStyle = color;
   ctx.font = "16px Arial";
-  ctx.fillText("START", START_CIRCLE.x - 28, START_CIRCLE.y - 48);
+  ctx.fillText(locked ? "LOCKED" : (readyLockStart ? "READY" : "START"), START_CIRCLE.x - 30, START_CIRCLE.y - 48);
 }
 
 function drawTargetCircle() {
@@ -333,6 +371,24 @@ function drawTrackedPoint(pos) {
   ctx.fill();
 }
 
+function drawReadyProgress() {
+  if (!readyLockStart || locked) return;
+
+  const elapsed = performance.now() - readyLockStart;
+  const progress = Math.max(0, Math.min(1, elapsed / READY_LOCK_MS));
+
+  const barW = 140;
+  const barH = 10;
+  const x = START_CIRCLE.x - barW / 2;
+  const y = START_CIRCLE.y + START_CIRCLE.r + 18;
+
+  ctx.strokeStyle = "#00ff00";
+  ctx.strokeRect(x, y, barW, barH);
+
+  ctx.fillStyle = "#ffff00";
+  ctx.fillRect(x, y, barW * progress, barH);
+}
+
 function checkTargetHit(pos) {
   if (targetHit) return;
 
@@ -345,45 +401,90 @@ function checkTargetHit(pos) {
   }
 }
 
+// ===== MAIN LOOP =====
 function loop() {
   requestAnimationFrame(loop);
 
   if (!video.videoWidth || !video.videoHeight) return;
 
-  // Draw single camera view
   ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-  // Overlay graphics
   drawStartCircle();
   drawTargetCircle();
   drawTrail();
+  drawReadyProgress();
 
   let result = null;
 
+  // ===== BEFORE LOCK =====
   if (!locked) {
     result = findObject({
       x: START_CIRCLE.x,
       y: START_CIRCLE.y,
-      r: START_CIRCLE.r + 20
-    });
+      r: START_CIRCLE.r + 24
+    }, false);
 
     if (result) {
       const d = dist(result.x, result.y, START_CIRCLE.x, START_CIRCLE.y);
-      if (d <= START_CIRCLE.r + 10) {
-        locked = true;
-        started = true;
-        lastPos = result;
-        trail = [{ x: result.x, y: result.y }];
-        targetHit = false;
-        statusEl.textContent = "Tracking started";
+
+      if (d <= START_CIRCLE.r + 8) {
+        if (!readyLockStart) {
+          readyLockStart = performance.now();
+          readyReference = { x: result.x, y: result.y };
+          statusEl.textContent = "Ball detected — hold steady for lock";
+        } else {
+          const stableMove = dist(result.x, result.y, readyReference.x, readyReference.y);
+
+          if (stableMove > READY_STABLE_MOVE) {
+            readyLockStart = performance.now();
+            readyReference = { x: result.x, y: result.y };
+            statusEl.textContent = "Re-stabilizing ball for lock";
+          } else {
+            const elapsed = performance.now() - readyLockStart;
+            if (elapsed >= READY_LOCK_MS) {
+              locked = true;
+              started = true;
+              lastPos = result;
+              trail = [{ x: result.x, y: result.y }];
+              targetHit = false;
+              lostFrames = 0;
+
+              lockedBallModel = {
+                w: result.w,
+                h: result.h,
+                count: result.count
+              };
+
+              statusEl.textContent = "Tracking locked";
+            }
+          }
+        }
+      } else {
+        readyLockStart = null;
+        readyReference = null;
+        statusEl.textContent = "Place ball in START circle";
       }
+    } else {
+      readyLockStart = null;
+      readyReference = null;
+      statusEl.textContent = "Place ball in START circle";
     }
-  } else {
+  }
+
+  // ===== AFTER LOCK =====
+  else {
     result = findObject({
       x: lastPos.x,
       y: lastPos.y,
       r: SEARCH_RADIUS
-    });
+    }, true);
+
+    if (result) {
+      const jump = dist(result.x, result.y, lastPos.x, lastPos.y);
+      if (jump > MAX_JUMP) {
+        result = null;
+      }
+    }
 
     if (result) {
       lostFrames = 0;
@@ -404,7 +505,10 @@ function loop() {
       if (lostFrames > LOST_FRAMES_MAX) {
         locked = false;
         lastPos = null;
-        statusEl.textContent = "Lost object — move white circle back to START";
+        readyLockStart = null;
+        readyReference = null;
+        lockedBallModel = null;
+        statusEl.textContent = "Lost ball — return to START circle";
       }
     }
   }
