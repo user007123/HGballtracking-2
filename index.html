@@ -71,11 +71,13 @@ const cameraSelect = document.getElementById("cameraSelect");
 const refreshCamsBtn = document.getElementById("refreshCams");
 const startCamBtn = document.getElementById("startCam");
 
-// ===== SETTINGS =====
+// =========================
+// SETTINGS
+// =========================
 const START_CIRCLE = {
   x: canvas.width - 120,
   y: canvas.height / 2,
-  r: 35
+  r: 38
 };
 
 const TARGET_CIRCLE = {
@@ -84,43 +86,56 @@ const TARGET_CIRCLE = {
   r: 40
 };
 
-// Detection tuning
-const SEARCH_RADIUS = 95;
-const MIN_PIXELS = 20;
-const BRIGHT_MIN = 150;
-const SAT_MAX = 70;
+// White-ball detection
+const BRIGHT_MIN = 135;
+const SAT_MAX = 80;
+const MIN_PIXELS = 10;
+const MAX_RATIO = 2.3;
+
+// Ready-lock
+const READY_LOCK_MS = 450;
+const READY_STABLE_MOVE = 10;
+
+// Tracking
+const SEARCH_RADIUS = 110;
 const LOST_FRAMES_MAX = 12;
+const MAX_JUMP = 65;
 
-// Ball-lock tuning
-const MAX_JUMP = 55;
-const SIZE_TOLERANCE = 2.2;
-const MAX_PIXELCOUNT_SCALE = 3.2;
-const MAX_RATIO = 2.0;
+// Ball model matching
+const SIZE_TOLERANCE_W = 2.2;
+const SIZE_TOLERANCE_H = 2.2;
+const PIXELCOUNT_SCALE_MAX = 3.5;
+const PIXELCOUNT_SCALE_MIN = 0.25;
 
-// Ready-lock tuning
-const READY_LOCK_MS = 400;     // ball must sit in start circle this long
-const READY_STABLE_MOVE = 14;  // movement allowed while arming lock
+// Movement detection
+const MOTION_START_DISTANCE = 8;   // must move this far from lock point to be in motion phase
+const MIN_TRAIL_POINT_DIST = 2;
 
-// ===== STATE =====
-let started = false;
-let locked = false;
-let lostFrames = 0;
-let lastPos = null;
-let trail = [];
-let score = 0;
-let targetHit = false;
-
+// =========================
+// STATE
+// =========================
 let currentStream = null;
 let animationStarted = false;
 
-// ready-lock state
+let score = 0;
+let targetHit = false;
+
 let readyLockStart = null;
 let readyReference = null;
 
-// locked ball model
+let locked = false;
+let trackingActive = false;   // phase 2: ball has started moving
+let lostFrames = 0;
+
+let lockPos = null;
+let lastPos = null;
+let trail = [];
+
 let lockedBallModel = null;
 
-// ===== CAMERA SETUP =====
+// =========================
+// CAMERA SETUP
+// =========================
 async function initCameraAccess() {
   try {
     const tempStream = await navigator.mediaDevices.getUserMedia({
@@ -145,7 +160,7 @@ async function initCameraAccess() {
       requestAnimationFrame(loop);
     }
 
-    statusEl.textContent = "Place ball in START circle and hold briefly";
+    statusEl.textContent = "Place ball in START circle and hold steady";
   } catch (err) {
     statusEl.textContent = "Camera error: " + err.message;
   }
@@ -209,28 +224,34 @@ async function startSelectedCamera() {
     });
 
     resetTrackingOnly();
-    statusEl.textContent = "Camera switched — place ball in START circle and hold briefly";
+    statusEl.textContent = "Camera switched — place ball in START circle and hold steady";
   } catch (err) {
     statusEl.textContent = "Could not start selected camera: " + err.message;
   }
 }
 
-// ===== RESET =====
+// =========================
+// RESET
+// =========================
 function resetTrackingOnly() {
-  started = false;
-  locked = false;
-  lostFrames = 0;
-  lastPos = null;
-  trail = [];
-  targetHit = false;
   readyLockStart = null;
   readyReference = null;
+
+  locked = false;
+  trackingActive = false;
+  lostFrames = 0;
+
+  lockPos = null;
+  lastPos = null;
+  trail = [];
+
   lockedBallModel = null;
+  targetHit = false;
 }
 
 resetBtn.onclick = () => {
   resetTrackingOnly();
-  statusEl.textContent = "Reset — place ball in START circle and hold briefly";
+  statusEl.textContent = "Reset — place ball in START circle and hold steady";
   updateScore();
 };
 
@@ -243,7 +264,9 @@ startCamBtn.onclick = async () => {
   await startSelectedCamera();
 };
 
-// ===== HELPERS =====
+// =========================
+// HELPERS
+// =========================
 function updateScore() {
   scoreEl.textContent = `Score: ${score}`;
 }
@@ -258,20 +281,28 @@ function isWhiteLike(r, g, b) {
   return bright >= BRIGHT_MIN && sat <= SAT_MAX;
 }
 
-function findObject(searchArea = null, useLockedModel = false) {
+/*
+  Connected-component blob finder:
+  - scans a search area
+  - groups touching white pixels into blobs
+  - returns candidate blobs
+*/
+function findBlobs(searchArea = null) {
   const frame = ctx.getImageData(0, 0, canvas.width, canvas.height);
   const data = frame.data;
 
-  let minX = searchArea ? Math.max(0, Math.floor(searchArea.x - searchArea.r)) : 0;
-  let maxX = searchArea ? Math.min(canvas.width - 1, Math.floor(searchArea.x + searchArea.r)) : canvas.width - 1;
-  let minY = searchArea ? Math.max(0, Math.floor(searchArea.y - searchArea.r)) : 0;
-  let maxY = searchArea ? Math.min(canvas.height - 1, Math.floor(searchArea.y + searchArea.r)) : canvas.height - 1;
+  const minX = searchArea ? Math.max(0, Math.floor(searchArea.x - searchArea.r)) : 0;
+  const maxX = searchArea ? Math.min(canvas.width - 1, Math.floor(searchArea.x + searchArea.r)) : canvas.width - 1;
+  const minY = searchArea ? Math.max(0, Math.floor(searchArea.y - searchArea.r)) : 0;
+  const maxY = searchArea ? Math.min(canvas.height - 1, Math.floor(searchArea.y + searchArea.r)) : canvas.height - 1;
 
-  let sumX = 0;
-  let sumY = 0;
-  let count = 0;
-  let boxMinX = Infinity, boxMaxX = -Infinity;
-  let boxMinY = Infinity, boxMaxY = -Infinity;
+  const w = maxX - minX + 1;
+  const h = maxY - minY + 1;
+
+  if (w <= 0 || h <= 0) return [];
+
+  const mask = new Uint8Array(w * h);
+  const visited = new Uint8Array(w * h);
 
   for (let y = minY; y <= maxY; y++) {
     for (let x = minX; x <= maxX; x++) {
@@ -283,50 +314,165 @@ function findObject(searchArea = null, useLockedModel = false) {
       const b = data[i + 2];
 
       if (isWhiteLike(r, g, b)) {
-        sumX += x;
-        sumY += y;
-        count++;
-
-        if (x < boxMinX) boxMinX = x;
-        if (x > boxMaxX) boxMaxX = x;
-        if (y < boxMinY) boxMinY = y;
-        if (y > boxMaxY) boxMaxY = y;
+        mask[(y - minY) * w + (x - minX)] = 1;
       }
     }
   }
 
-  if (count < MIN_PIXELS) return null;
+  const blobs = [];
+  const stack = [];
 
-  const w = Math.max(1, boxMaxX - boxMinX);
-  const h = Math.max(1, boxMaxY - boxMinY);
-  const ratio = w > h ? w / h : h / w;
+  for (let sy = 0; sy < h; sy++) {
+    for (let sx = 0; sx < w; sx++) {
+      const idx = sy * w + sx;
+      if (!mask[idx] || visited[idx]) continue;
 
-  // reject long/skinny objects like shafts or streaks
-  if (ratio > MAX_RATIO) return null;
+      let count = 0;
+      let sumX = 0;
+      let sumY = 0;
+      let boxMinX = Infinity, boxMaxX = -Infinity;
+      let boxMinY = Infinity, boxMaxY = -Infinity;
 
-  const result = {
-    x: sumX / count,
-    y: sumY / count,
-    count,
-    w,
-    h,
-    ratio
-  };
+      visited[idx] = 1;
+      stack.push([sx, sy]);
 
-  if (useLockedModel && lockedBallModel) {
-    if (result.w > lockedBallModel.w * SIZE_TOLERANCE) return null;
-    if (result.h > lockedBallModel.h * SIZE_TOLERANCE) return null;
-    if (result.count > lockedBallModel.count * MAX_PIXELCOUNT_SCALE) return null;
+      while (stack.length) {
+        const [cx, cy] = stack.pop();
+        const gx = minX + cx;
+        const gy = minY + cy;
+
+        count++;
+        sumX += gx;
+        sumY += gy;
+
+        if (gx < boxMinX) boxMinX = gx;
+        if (gx > boxMaxX) boxMaxX = gx;
+        if (gy < boxMinY) boxMinY = gy;
+        if (gy > boxMaxY) boxMaxY = gy;
+
+        const neighbors = [
+          [cx + 1, cy],
+          [cx - 1, cy],
+          [cx, cy + 1],
+          [cx, cy - 1],
+          [cx + 1, cy + 1],
+          [cx - 1, cy - 1],
+          [cx + 1, cy - 1],
+          [cx - 1, cy + 1]
+        ];
+
+        for (const [nx, ny] of neighbors) {
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h) continue;
+          const nIdx = ny * w + nx;
+          if (!mask[nIdx] || visited[nIdx]) continue;
+          visited[nIdx] = 1;
+          stack.push([nx, ny]);
+        }
+      }
+
+      if (count >= MIN_PIXELS) {
+        const bw = Math.max(1, boxMaxX - boxMinX);
+        const bh = Math.max(1, boxMaxY - boxMinY);
+        const ratio = bw > bh ? bw / bh : bh / bw;
+
+        if (ratio <= MAX_RATIO) {
+          blobs.push({
+            x: sumX / count,
+            y: sumY / count,
+            count,
+            w: bw,
+            h: bh,
+            ratio,
+            areaScore: bw * bh
+          });
+        }
+      }
+    }
   }
 
-  return result;
+  return blobs;
+}
+
+function scoreBlobForLock(blob) {
+  // prefer smaller, more circular blobs close to the start center
+  const d = dist(blob.x, blob.y, START_CIRCLE.x, START_CIRCLE.y);
+  const ratioPenalty = Math.abs(1 - (blob.w / Math.max(blob.h, 1))) * 20;
+  return d + ratioPenalty + blob.areaScore * 0.03;
+}
+
+function chooseLockBlob(blobs) {
+  if (!blobs.length) return null;
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const blob of blobs) {
+    const d = dist(blob.x, blob.y, START_CIRCLE.x, START_CIRCLE.y);
+    if (d > START_CIRCLE.r + 10) continue;
+
+    const s = scoreBlobForLock(blob);
+    if (s < bestScore) {
+      bestScore = s;
+      best = blob;
+    }
+  }
+
+  return best;
+}
+
+function scoreBlobForTracking(blob) {
+  if (!lockedBallModel || !lastPos) return Infinity;
+
+  const moveDist = dist(blob.x, blob.y, lastPos.x, lastPos.y);
+  const wDiff = Math.abs(blob.w - lockedBallModel.w) / Math.max(lockedBallModel.w, 1);
+  const hDiff = Math.abs(blob.h - lockedBallModel.h) / Math.max(lockedBallModel.h, 1);
+  const cDiff = Math.abs(blob.count - lockedBallModel.count) / Math.max(lockedBallModel.count, 1);
+  const ratioDiff = Math.abs(blob.ratio - lockedBallModel.ratio);
+
+  return moveDist + (wDiff * 25) + (hDiff * 25) + (cDiff * 15) + (ratioDiff * 15);
+}
+
+function chooseTrackingBlob(blobs) {
+  if (!blobs.length || !lockedBallModel || !lastPos) return null;
+
+  let best = null;
+  let bestScore = Infinity;
+
+  for (const blob of blobs) {
+    // size gates to reject putter / big reflections
+    if (blob.w > lockedBallModel.w * SIZE_TOLERANCE_W) continue;
+    if (blob.h > lockedBallModel.h * SIZE_TOLERANCE_H) continue;
+    if (blob.count > lockedBallModel.count * PIXELCOUNT_SCALE_MAX) continue;
+    if (blob.count < lockedBallModel.count * PIXELCOUNT_SCALE_MIN) continue;
+
+    const jump = dist(blob.x, blob.y, lastPos.x, lastPos.y);
+    if (jump > MAX_JUMP) continue;
+
+    const s = scoreBlobForTracking(blob);
+    if (s < bestScore) {
+      bestScore = s;
+      best = blob;
+    }
+  }
+
+  return best;
 }
 
 function drawStartCircle() {
   let color = "#00ff00";
+  let text = "START";
 
   if (readyLockStart && !locked) {
     color = "#ffff00";
+    text = "READY";
+  }
+  if (locked && !trackingActive) {
+    color = "#00ffff";
+    text = "LOCKED";
+  }
+  if (locked && trackingActive) {
+    color = "#00ff00";
+    text = "TRACK";
   }
 
   ctx.strokeStyle = color;
@@ -337,7 +483,7 @@ function drawStartCircle() {
 
   ctx.fillStyle = color;
   ctx.font = "16px Arial";
-  ctx.fillText(locked ? "LOCKED" : (readyLockStart ? "READY" : "START"), START_CIRCLE.x - 30, START_CIRCLE.y - 48);
+  ctx.fillText(text, START_CIRCLE.x - 28, START_CIRCLE.y - 48);
 }
 
 function drawTargetCircle() {
@@ -401,7 +547,9 @@ function checkTargetHit(pos) {
   }
 }
 
-// ===== MAIN LOOP =====
+// =========================
+// MAIN LOOP
+// =========================
 function loop() {
   requestAnimationFrame(loop);
 
@@ -414,56 +562,55 @@ function loop() {
   drawTrail();
   drawReadyProgress();
 
-  let result = null;
-
-  // ===== BEFORE LOCK =====
+  // -------------------------
+  // PHASE 1: READY / LOCK
+  // -------------------------
   if (!locked) {
-    result = findObject({
+    const blobs = findBlobs({
       x: START_CIRCLE.x,
       y: START_CIRCLE.y,
-      r: START_CIRCLE.r + 24
-    }, false);
+      r: START_CIRCLE.r + 26
+    });
 
-    if (result) {
-      const d = dist(result.x, result.y, START_CIRCLE.x, START_CIRCLE.y);
+    const candidate = chooseLockBlob(blobs);
 
-      if (d <= START_CIRCLE.r + 8) {
-        if (!readyLockStart) {
+    if (candidate) {
+      if (!readyLockStart) {
+        readyLockStart = performance.now();
+        readyReference = { x: candidate.x, y: candidate.y };
+        statusEl.textContent = "Ball detected — hold steady for lock";
+      } else {
+        const stableMove = dist(candidate.x, candidate.y, readyReference.x, readyReference.y);
+
+        if (stableMove > READY_STABLE_MOVE) {
           readyLockStart = performance.now();
-          readyReference = { x: result.x, y: result.y };
-          statusEl.textContent = "Ball detected — hold steady for lock";
+          readyReference = { x: candidate.x, y: candidate.y };
+          statusEl.textContent = "Re-stabilizing ball for lock";
         } else {
-          const stableMove = dist(result.x, result.y, readyReference.x, readyReference.y);
+          const elapsed = performance.now() - readyLockStart;
+          if (elapsed >= READY_LOCK_MS) {
+            locked = true;
+            trackingActive = false;
+            lostFrames = 0;
 
-          if (stableMove > READY_STABLE_MOVE) {
-            readyLockStart = performance.now();
-            readyReference = { x: result.x, y: result.y };
-            statusEl.textContent = "Re-stabilizing ball for lock";
-          } else {
-            const elapsed = performance.now() - readyLockStart;
-            if (elapsed >= READY_LOCK_MS) {
-              locked = true;
-              started = true;
-              lastPos = result;
-              trail = [{ x: result.x, y: result.y }];
-              targetHit = false;
-              lostFrames = 0;
+            lockPos = { x: candidate.x, y: candidate.y };
+            lastPos = { x: candidate.x, y: candidate.y };
+            trail = [{ x: candidate.x, y: candidate.y }];
+            targetHit = false;
 
-              lockedBallModel = {
-                w: result.w,
-                h: result.h,
-                count: result.count
-              };
+            lockedBallModel = {
+              w: candidate.w,
+              h: candidate.h,
+              count: candidate.count,
+              ratio: candidate.ratio
+            };
 
-              statusEl.textContent = "Tracking locked";
-            }
+            statusEl.textContent = "Ball locked — waiting for movement";
           }
         }
-      } else {
-        readyLockStart = null;
-        readyReference = null;
-        statusEl.textContent = "Place ball in START circle";
       }
+
+      drawTrackedPoint(candidate);
     } else {
       readyLockStart = null;
       readyReference = null;
@@ -471,50 +618,80 @@ function loop() {
     }
   }
 
-  // ===== AFTER LOCK =====
-  else {
-    result = findObject({
+  // -------------------------
+  // PHASE 2A: LOCKED, WAITING FOR MOTION
+  // -------------------------
+  else if (locked && !trackingActive) {
+    const blobs = findBlobs({
       x: lastPos.x,
       y: lastPos.y,
       r: SEARCH_RADIUS
-    }, true);
+    });
 
-    if (result) {
-      const jump = dist(result.x, result.y, lastPos.x, lastPos.y);
-      if (jump > MAX_JUMP) {
-        result = null;
+    const candidate = chooseTrackingBlob(blobs);
+
+    if (candidate) {
+      lastPos = { x: candidate.x, y: candidate.y };
+      drawTrackedPoint(candidate);
+
+      const movedFromLock = dist(candidate.x, candidate.y, lockPos.x, lockPos.y);
+
+      if (movedFromLock >= MOTION_START_DISTANCE) {
+        trackingActive = true;
+        trail.push({ x: candidate.x, y: candidate.y });
+        statusEl.textContent = "Motion detected — tracking putt";
+      } else {
+        statusEl.textContent = "Ball locked — waiting for movement";
       }
+    } else {
+      statusEl.textContent = "Ball locked — waiting for movement";
     }
+  }
 
-    if (result) {
+  // -------------------------
+  // PHASE 2B: ACTIVE TRACKING
+  // -------------------------
+  else if (locked && trackingActive) {
+    const blobs = findBlobs({
+      x: lastPos.x,
+      y: lastPos.y,
+      r: SEARCH_RADIUS
+    });
+
+    const candidate = chooseTrackingBlob(blobs);
+
+    if (candidate) {
       lostFrames = 0;
-      lastPos = result;
+      lastPos = { x: candidate.x, y: candidate.y };
 
       const prev = trail.length ? trail[trail.length - 1] : null;
-      if (!prev || dist(prev.x, prev.y, result.x, result.y) > 2) {
-        trail.push({ x: result.x, y: result.y });
+      if (!prev || dist(prev.x, prev.y, candidate.x, candidate.y) > MIN_TRAIL_POINT_DIST) {
+        trail.push({ x: candidate.x, y: candidate.y });
       }
 
-      checkTargetHit(result);
+      checkTargetHit(candidate);
 
       if (!targetHit) {
-        statusEl.textContent = `Tracking — x: ${result.x.toFixed(0)} y: ${result.y.toFixed(0)}`;
+        statusEl.textContent = `Tracking — x: ${candidate.x.toFixed(0)} y: ${candidate.y.toFixed(0)}`;
       }
+
+      drawTrackedPoint(candidate);
     } else {
       lostFrames++;
       if (lostFrames > LOST_FRAMES_MAX) {
         locked = false;
+        trackingActive = false;
+        lostFrames = 0;
+        lockPos = null;
         lastPos = null;
         readyLockStart = null;
         readyReference = null;
         lockedBallModel = null;
         statusEl.textContent = "Lost ball — return to START circle";
+      } else if (lastPos) {
+        drawTrackedPoint(lastPos);
       }
     }
-  }
-
-  if (lastPos) {
-    drawTrackedPoint(lastPos);
   }
 }
 
